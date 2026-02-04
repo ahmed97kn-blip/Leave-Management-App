@@ -1,0 +1,1052 @@
+// ====================================================================
+// === CONFIGURATION ===
+// ====================================================================
+const SLACK_BOT_TOKEN = "";
+const SLACK_USER_TOKEN = ""; 
+const SPREADSHEET_ID = "";
+const APPROVAL_CHANNEL = ""; 
+
+// API Constants
+const SLACK_API_BASE = "https://slack.com/api/";
+
+// WEEKEND CONFIGURATION 
+const WEEKEND_BGD = ["Fri", "Sat"];
+const WEEKEND_UEA = ["Sat", "Sun"];
+const WEEKEND_DEFAULT = ["Fri", "Sat"];
+
+// Sheet Names
+const SHEET_NAME_USERS = "Users";
+const SHEET_NAME_REQUESTS = "Requests";
+const SHEET_NAME_AUDIT_LOG = "AuditLog"; 
+const SHEET_NAME_POLICY = "Policy";
+const POLICY_CELL = "A1"; 
+
+// Users Sheet Columns (0-indexed)
+const COL_USER_NAME = 0;
+const COL_USER_SLACK_ID = 1;
+const COL_USER_ANNUAL_BALANCE = 2;
+const COL_USER_SICK_BALANCE = 3;
+const COL_USER_APPROVER_ID = 4;
+const COL_USER_LOCATION = 5;
+const COL_USER_ROLE = 7; 
+const COL_USER_COMPANY = 8; 
+
+// Requests Sheet Columns (0-indexed)
+const COL_REQ_NAME = 0;
+const COL_REQ_SLACK_ID = 1;
+const COL_REQ_START_DATE = 2;
+const COL_REQ_END_DATE = 3;
+const COL_REQ_TYPE = 4;
+const COL_REQ_STATUS = 5;
+const COL_REQ_APPROVER_ID = 6;
+const COL_REQ_CREATED_AT = 7;
+const COL_REQ_ATTACHMENT = 8;
+const COL_REQ_WEEKEND = 9;
+const COL_REQ_HALF_DAY = 10; 
+
+// ====================================================================
+// === 🚀 ULTRA-FAST CACHE SYSTEM ===
+// ====================================================================
+
+let _cachedSS = null;
+let _cachedUserMap = null; 
+let _cachedRequests = null;
+
+function getSS() {
+  if (!_cachedSS) _cachedSS = SpreadsheetApp.openById(SPREADSHEET_ID);
+  return _cachedSS;
+}
+
+function getSheet(name) {
+  return getSS().getSheetByName(name);
+}
+
+/**
+ * ⚡ SPEED BOOST: Uses CacheService to avoid reading Spreadsheet on every click.
+ */
+function loadUserData() {
+  if (_cachedUserMap) return;
+
+  // 1. Try to load from fast memory cache
+  const cache = CacheService.getScriptCache();
+  const cachedData = cache.get("USER_MAP_V3"); 
+
+  if (cachedData) {
+    _cachedUserMap = JSON.parse(cachedData);
+    return;
+  }
+
+  // 2. If not in cache, read Spreadsheet
+  try {
+    const sheet = getSheet(SHEET_NAME_USERS);
+    const data = sheet.getDataRange().getValues();
+    _cachedUserMap = {};
+    
+    // Build Map
+    for (let i = 0; i < data.length; i++) {
+        const row = data[i];
+        const slackId = row[COL_USER_SLACK_ID];
+        if (slackId && slackId !== "Slack ID") {
+            // Trim and uppercase role to be safe
+            let rawRole = String(row[COL_USER_ROLE] || "").trim().toUpperCase();
+            
+            _cachedUserMap[slackId] = {
+                rowIndex: i, 
+                name: row[COL_USER_NAME],
+                role: rawRole,
+                loc: String(row[COL_USER_LOCATION] || "").toUpperCase(),
+                appr: row[COL_USER_APPROVER_ID],
+                balAnn: row[COL_USER_ANNUAL_BALANCE],
+                balSick: row[COL_USER_SICK_BALANCE]
+            };
+        }
+    }
+    
+    // 3. Save to fast memory
+    try {
+        cache.put("USER_MAP_V3", JSON.stringify(_cachedUserMap), 600);
+    } catch(e) {
+        Logger.log("Cache too large to save");
+    }
+
+  } catch (e) {
+    Logger.log("Error loading user data: " + e.toString());
+    _cachedUserMap = {};
+  }
+}
+
+// Helper to get fresh data row index
+function getUserRowIndex(slackId) {
+    if (!_cachedUserMap) loadUserData();
+    return _cachedUserMap[slackId] ? _cachedUserMap[slackId].rowIndex : -1;
+}
+
+function getUserName(slackId) {
+  if (!_cachedUserMap) loadUserData(); 
+  const user = _cachedUserMap[slackId];
+  return user ? user.name : `<@${slackId}>`;
+}
+
+/**
+ * 🛡️ STRONGER HR CHECK
+ * If cache says false, we double check the sheet just to be sure.
+ */
+function isHR(slackId) {
+  if (!_cachedUserMap) loadUserData();
+  const user = _cachedUserMap[slackId];
+  
+  // 1. Check Cache first
+  if (user && user.role === "HR") return true;
+
+  // 2. FAILSAFE: If cache says no, but user exists, FORCE READ SHEET ROW
+  // This fixes the issue where cache might have old data or missed the update
+  if (user) {
+      try {
+          const sheet = getSheet(SHEET_NAME_USERS);
+          const freshRole = sheet.getRange(user.rowIndex + 1, COL_USER_ROLE + 1).getValue();
+          const cleanRole = String(freshRole || "").trim().toUpperCase();
+          if (cleanRole === "HR") {
+              // Update local cache so it's fast next time
+              user.role = "HR"; 
+              return true;
+          }
+      } catch(e) {}
+  }
+  return false;
+}
+
+// --- LAZY REQUESTS LOADING ---
+function getRequestsData() {
+    if (_cachedRequests) return _cachedRequests;
+    try {
+        const sheet = getSheet(SHEET_NAME_REQUESTS);
+        // Remove header row immediately
+        _cachedRequests = sheet.getDataRange().getValues().slice(1);
+    } catch (e) {
+        _cachedRequests = [];
+    }
+    return _cachedRequests;
+}
+
+// ====================================================================
+// === API UTILITIES ===
+// ====================================================================
+
+function slackApiFetch(endpoint, payload, isUserToken = false) {
+  const token = isUserToken ? SLACK_USER_TOKEN : SLACK_BOT_TOKEN; 
+  try {
+    return UrlFetchApp.fetch(SLACK_API_BASE + endpoint, {
+      method: "post",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    Logger.log(`API Error: ${e.toString()}`);
+    return null;
+  }
+}
+
+function postSlackMessage(channel, text) {
+  slackApiFetch("chat.postMessage", { channel, text });
+}
+
+function postSlackBlocks(channel, blocks) {
+  slackApiFetch("chat.postMessage", { channel, blocks });
+}
+
+function updateUserSlackStatus(userId, type, endDate) {
+  let emoji = ":spiral_calendar_pad:";
+  let text = "On Leave";
+
+  if (type === "Annual") { emoji = ":beach_with_umbrella:"; text = "On Annual Leave"; }
+  else if (type === "Sick") { emoji = ":face_with_thermometer:"; text = "Sick Leave"; }
+  else if (type === "Working Remotely") { emoji = ":house_with_garden:"; text = "Working Remotely"; }
+  else if (type === "Maternity" || type === "Paternity") { emoji = ":baby:"; text = "Parental Leave"; }
+
+  const expiration = new Date(endDate);
+  expiration.setHours(23, 59, 59, 0);
+  
+  slackApiFetch("users.profile.set", {
+    user: userId, 
+    profile: {
+        status_text: text,
+        status_emoji: emoji,
+        status_expiration: Math.floor(expiration.getTime() / 1000)
+    }
+  }, true); 
+}
+
+// ====================================================================
+// === UTILITIES ===
+// ====================================================================
+
+function getLeaveTypeOptions() {
+  return [
+    { text: { type: "plain_text", text: "Annual" }, value: "Annual" },
+    { text: { type: "plain_text", text: "Sick" }, value: "Sick" },
+    { text: { type: "plain_text", text: "Maternity" }, value: "Maternity" },
+    { text: { type: "plain_text", text: "Paternity" }, value: "Paternity" }, 
+    { text: { type: "plain_text", text: "Unpaid" }, value: "Unpaid" },
+    { text: { type: "plain_text", text: "Training" }, value: "Training" }
+  ];
+}
+
+function logAuditEntry(actorId, targetId, action, details, oldValue = "N/A", newValue = "N/A") {
+  try {
+    const sheet = getSheet(SHEET_NAME_AUDIT_LOG);
+    sheet.appendRow([new Date(), getUserName(actorId), actorId, action, getUserName(targetId), targetId, details, oldValue, newValue]);
+  } catch (e) {}
+}
+
+/**
+ * ⚡ FAST DATE FORMATTER
+ * Converts any date input to "YYYY-MM-DD" string using script timezone.
+ */
+function toDateString(dateInput) {
+    if (!dateInput) return "";
+    const d = (dateInput instanceof Date) ? dateInput : new Date(dateInput);
+    if (isNaN(d.getTime())) return "";
+    return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+}
+
+function normalizeDate(date) {
+    if (!date) return null;
+    const d = new Date(date);
+    d.setHours(0,0,0,0);
+    return d;
+}
+
+function getCurrentPolicyText() {
+  try {
+    return getSheet(SHEET_NAME_POLICY).getRange(POLICY_CELL).getValue();
+  } catch (e) { return "No policy."; }
+}
+
+/**
+ * ⚡ OPTIMIZED OVERLAP CHECK
+ * Uses String comparison ("2023-01-01") instead of Date objects.
+ */
+function hasDateOverlap(userId, newStartStr, newEndStr) {
+    // 1. Get Cached Data
+    const data = getRequestsData(); 
+    
+    // 2. Filter using String Comparison
+    const conflicts = data.filter(r => {
+        if (r[COL_REQ_SLACK_ID] !== userId) return false;
+        if (r[COL_REQ_STATUS] === "Rejected") return false;
+        
+        // Convert Sheet Data to Strings (YYYY-MM-DD)
+        const sheetStart = toDateString(r[COL_REQ_START_DATE]);
+        const sheetEnd = toDateString(r[COL_REQ_END_DATE]);
+
+        // Overlap Logic: (StartA <= EndB) and (EndA >= StartB)
+        return (newStartStr <= sheetEnd) && (newEndStr >= sheetStart);
+    });
+    
+    return conflicts.length > 0;
+}
+
+function calculateLeaveDays(start, end, weekendSelection) {
+  const weekendDays = (weekendSelection || []).map(d => ({ Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 })[d]).filter(x => typeof x === "number");
+  let days = 0;
+  let current = normalizeDate(start);
+  const endDate = normalizeDate(end);
+  
+  let count = 0;
+  while (current <= endDate && count < 365) {
+    if (!weekendDays.includes(current.getDay())) days++;
+    current.setDate(current.getDate() + 1);
+    count++;
+  }
+  return days;
+}
+
+function calculateUserStats(targetUserId) {
+  let pendingAnnual = 0;
+  let pendingSick = 0;
+  let usedAnnual = 0;
+  let usedSick = 0;
+
+  const requestsData = getRequestsData();
+  const userRequests = requestsData.filter(r => r[COL_REQ_SLACK_ID] === targetUserId);
+
+  userRequests.forEach(r => {
+    const type = r[COL_REQ_TYPE];
+    const status = r[COL_REQ_STATUS];
+    
+    if ((type !== "Annual" && type !== "Sick") || status === "Rejected") return;
+
+    const start = r[COL_REQ_START_DATE];
+    const end = r[COL_REQ_END_DATE];
+    const weekendSelection = (r[COL_REQ_WEEKEND] || "").split(",").filter(Boolean);
+    const days = calculateLeaveDays(start, end, weekendSelection);
+
+    if (status === "Pending") {
+        if (type === "Annual") pendingAnnual += days;
+        if (type === "Sick") pendingSick += days;
+    } else if (status === "Approved") {
+        if (type === "Annual") usedAnnual += days;
+        if (type === "Sick") usedSick += days;
+    }
+  });
+
+  return { pendingAnnual, pendingSick, usedAnnual, usedSick };
+}
+
+// ====================================================================
+// === ENTRY POINT (doPost) ===
+// ====================================================================
+function doPost(e) {
+  try {
+    if (!e || !e.postData) return ContentService.createTextOutput("");
+    
+    loadUserData(); 
+
+    const contents = e.postData.contents;
+    if (contents.includes("url_verification")) {
+      return ContentService.createTextOutput(JSON.parse(contents).challenge);
+    }
+
+    const params = e.parameter;
+
+    // Slash Commands
+    if (params && params.command) {
+      handleSlashCommand(params);
+      return ContentService.createTextOutput(""); 
+    }
+
+    // Interactive Components
+    if (params && params.payload) {
+      const payload = JSON.parse(params.payload);
+      const result = handleInteractive(payload);
+      if (result) {
+        return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);
+      }
+      return ContentService.createTextOutput("");
+    }
+    
+    // Events
+    if (contents.includes('"event"')) {
+      const body = JSON.parse(contents);
+      if (body.event && body.event.type === "app_home_opened") {
+        updateSlackHome(body.event.user);
+      }
+      return ContentService.createTextOutput("");
+    }
+
+  } catch (err) {
+    Logger.log(`CRITICAL ERROR: ${err.toString()}`);
+  }
+  return ContentService.createTextOutput("");
+}
+
+// ====================================================================
+// === HANDLERS ===
+// ====================================================================
+
+function handleSlashCommand(params) {
+  const userId = params.user_id;
+  // Route command
+  if (params.command === "/request_leave") openLeaveModal(params.trigger_id, userId);
+  else if (params.command === "/my_balance") handleMyBalance(userId);
+  else if (params.command === "/team_balance") handleTeamBalance(userId);
+  else if (params.command === "/manage_balances") openAdminBalanceModal(params.trigger_id, userId);
+  else if (params.command === "/update_policy") openPolicyUpdateModal(params.trigger_id, userId);
+  else if (params.command === "/send_announcement") openAnnouncementModal(params.trigger_id, userId);
+}
+
+function handleInteractive(payload) {
+  if (!payload) return;
+
+  if (payload.type === "view_submission") {
+    const cb = payload.view.callback_id;
+    if (cb === "request_leave_modal") return handleLeaveSubmission(payload);
+    if (cb === "working_remotely_modal") return handleWorkingRemotelySubmission(payload);
+    if (cb === "generate_hr_report") return handleHRReportSubmission(payload); 
+    if (cb === "team_leaves_filter_modal") return handleTeamLeavesFilterSubmission(payload); 
+    if (cb === "my_leaves_filter_modal") return handleMyLeavesFilterSubmission(payload); 
+    if (cb === "admin_balance_modal") return handleAdminBalanceSubmission(payload); 
+    if (cb === "update_policy_modal") return handlePolicyUpdateSubmission(payload); 
+    if (cb === "send_announcement_modal") return handleAnnouncementSubmission(payload);
+  }
+
+  if (payload.type === "block_actions") {
+    const action = payload.actions[0];
+    const actionId = action.action_id;
+    const userId = payload.user.id;
+    const triggerId = payload.trigger_id;
+
+    if (actionId === "approve" || actionId === "reject") {
+        const value = JSON.parse(action.value || "{}");
+        if (payload.response_url) {
+            slackApiFetch(payload.response_url, {
+                payload: JSON.stringify({ replace_original: false, text: `✅ *Processing...*` })
+            });
+        }
+        processApproveReject(userId, value.rowIndex, actionId === "approve");
+        return;
+    }
+    
+    // NEW REFRESH BUTTON
+    if (actionId === "refresh_data") {
+        CacheService.getScriptCache().remove("USER_MAP_V3");
+        _cachedUserMap = null;
+        loadUserData();
+        postSlackMessage(userId, "✅ Data Refreshed from Sheet.");
+        updateSlackHome(userId);
+        return;
+    }
+
+    if (triggerId) {
+        if (actionId === "request_leave_home") openLeaveModal(triggerId, userId);
+        else if (actionId === "working_remotely_home") openWorkingRemotelyModal(triggerId, userId);
+        else if (actionId === "my_leaves_home") openMyLeavesFilterModal(triggerId, userId);
+        else if (actionId === "team_leaves_home") openTeamLeavesFilterModal(triggerId, userId);
+        else if (actionId === "hr_reports") openHRReportModal(triggerId, userId);
+        else if (actionId === "admin_balances") openAdminBalanceModal(triggerId, userId);
+        else if (actionId === "update_policy") openPolicyUpdateModal(triggerId, userId);
+        else if (actionId === "send_announcement") openAnnouncementModal(triggerId, userId);
+    }
+    
+    if (actionId === "team_balance_home") handleTeamBalance(userId);
+  }
+}
+
+// ====================================================================
+// === LEAVE SUBMISSION LOGIC ===
+// ====================================================================
+
+function handleLeaveSubmission(payload) {
+    try {
+        const values = payload.view.state.values;
+        const userId = payload.user.id;
+        
+        if (!_cachedUserMap) loadUserData();
+        const userCache = _cachedUserMap[userId];
+        if (!userCache) return { response_action: "errors", errors: { start_date: "User record not found." } };
+
+        const type = values.leave_type.type.selected_option.value;
+        const start = values.start_date.start.selected_date; 
+        const end = values.end_date.end.selected_date;     
+        const attachmentUrl = values.attachment_url?.url?.value || "";
+        const customApprover = values.approver_select?.approver?.selected_user; 
+
+        if (start > end) return { response_action: "errors", errors: { end_date: "End date must be after start." } };
+
+        // ⚡ OVERLAP CHECK
+        if (hasDateOverlap(userId, start, end)) {
+             return { response_action: "errors", errors: { start_date: "⚠ You already have an Approved or Pending request in this date range." } };
+        }
+
+        let weekendSelection;
+        // DETECT IF CC TEAM DROPDOWN WAS PRESENT
+        if (values.weekend_days && values.weekend_days.days) {
+            weekendSelection = (values.weekend_days.days.selected_options || []).map(o => o.value);
+            if (!weekendSelection || weekendSelection.length !== 2) {
+                return { response_action: "errors", errors: { weekend_days: "Please select exactly 2 weekend days." } };
+            }
+        } else {
+            // Standard Logic
+            if (userCache.loc === "UEA") weekendSelection = WEEKEND_UEA;
+            else if (userCache.loc === "BGD") weekendSelection = WEEKEND_BGD;
+            else weekendSelection = WEEKEND_DEFAULT;
+        }
+
+        processLeaveRequest(userId, type, start, end, attachmentUrl, weekendSelection, "Full", customApprover);
+        return; 
+    } catch (e) {
+        return { response_action: "errors", errors: { start_date: "System error: " + e.message } };
+    }
+}
+
+function handleWorkingRemotelySubmission(payload) {
+    const values = payload.view.state.values;
+    const userId = payload.user.id;
+    
+    const start = values.start_date.start.selected_date;
+    const end = values.end_date.end.selected_date;
+    const note = values.note?.note?.value || "";
+    
+    // ⚡ OVERLAP CHECK
+    if (hasDateOverlap(userId, start, end)) {
+         return { response_action: "errors", errors: { start_date: "⚠ You already have an Approved or Pending request in this date range." } };
+    }
+
+    if (!_cachedUserMap) loadUserData();
+    const userCache = _cachedUserMap[userId];
+    if (!userCache) return;
+
+    const sheet = getSheet(SHEET_NAME_REQUESTS);
+    sheet.appendRow([userCache.name, userId, start, end, "Working Remotely", "Pending", userCache.appr, new Date(), note, "", "Full"]);
+    
+    const rowIndex = sheet.getLastRow();
+    postSlackMessage(userId, `✅ Working Remotely request pending.`);
+    
+    // UPDATED BUTTONS: "Noted" & "Let's talk"
+    const blocks = [
+        { type: "section", text: { type: "mrkdwn", text: `<@${userId}> requested *Working Remotely* from ${start} to ${end}\nNote: ${note}` } },
+        { type: "actions", elements: [
+            { type: "button", text: { type: "plain_text", text: "Noted" }, style: "primary", action_id: "approve", value: JSON.stringify({ rowIndex }) },
+            { type: "button", text: { type: "plain_text", text: "Let's talk" }, style: "danger", action_id: "reject", value: JSON.stringify({ rowIndex }) }
+        ]}
+    ];
+    postSlackBlocks(userCache.appr, blocks);
+}
+
+function processLeaveRequest(userId, type, start, end, attachmentUrl, weekendSelection, halfDaySelection, customApproverId) {
+    if (!_cachedUserMap) loadUserData();
+    const userCache = _cachedUserMap[userId];
+
+    const approverId = customApproverId || userCache.appr;
+    const daysRequested = calculateLeaveDays(start, end, weekendSelection);
+    
+    if (type === "Annual" && daysRequested > Number(userCache.balAnn)) { postSlackMessage(userId, `⚠ Insufficient Annual Balance.`); return; }
+    if (type === "Sick" && daysRequested > Number(userCache.balSick)) { postSlackMessage(userId, `⚠ Insufficient Sick Balance.`); return; }
+
+    const sheet = getSheet(SHEET_NAME_REQUESTS);
+    sheet.appendRow([userCache.name, userId, start, end, type, "Pending", approverId, new Date(), attachmentUrl, weekendSelection.join(","), halfDaySelection]);
+    
+    const rowIndex = sheet.getLastRow();
+    postSlackMessage(userId, `✅ ${type} Request sent to approver.`);
+    
+    // UPDATED BUTTONS: "Noted" & "Let's talk"
+    const blocks = [
+        { type: "section", text: { type: "mrkdwn", text: `<@${userId}> requested *${type}* (${daysRequested} days) from ${start} to ${end}` } },
+        { type: "actions", elements: [
+            { type: "button", text: { type: "plain_text", text: "Noted" }, style: "primary", action_id: "approve", value: JSON.stringify({ rowIndex }) },
+            { type: "button", text: { type: "plain_text", text: "Let's talk" }, style: "danger", action_id: "reject", value: JSON.stringify({ rowIndex }) }
+        ]}
+    ];
+    postSlackBlocks(approverId, blocks);
+}
+
+// ====================================================================
+// === APPROVAL & BALANCE SYNC ===
+// ====================================================================
+
+function processApproveReject(approverId, rowIndex, approve) {
+    const sheet = getSheet(SHEET_NAME_REQUESTS);
+    const rowRange = sheet.getRange(rowIndex, 1, 1, 11);
+    const row = rowRange.getValues()[0];
+    
+    if (row[COL_REQ_STATUS] !== "Pending") return; 
+    
+    sheet.getRange(rowIndex, COL_REQ_STATUS + 1).setValue(approve ? "Approved" : "Rejected");
+    
+    const requesterId = row[COL_REQ_SLACK_ID];
+    const type = row[COL_REQ_TYPE];
+    
+    if (approve) {
+        if (type === "Annual" || type === "Sick") {
+            const days = calculateLeaveDays(row[COL_REQ_START_DATE], row[COL_REQ_END_DATE], (row[COL_REQ_WEEKEND]||"").split(","));
+            
+            // 🛑 FORCE SYNC: Read direct from sheet
+            if (!_cachedUserMap) loadUserData();
+            const userIdx = getUserRowIndex(requesterId);
+            
+            if (userIdx > -1) {
+                const usersSheet = getSheet(SHEET_NAME_USERS);
+                const colIdx = type === "Annual" ? COL_USER_ANNUAL_BALANCE + 1 : COL_USER_SICK_BALANCE + 1;
+                const cell = usersSheet.getRange(userIdx + 1, colIdx);
+                
+                // Read current, Subtract, Write
+                const currentBal = cell.getValue();
+                cell.setValue(currentBal - days);
+                
+                // 🛑 DESTROY CACHE
+                CacheService.getScriptCache().remove("USER_MAP_V3");
+                _cachedUserMap = null;
+            }
+        }
+
+        // 🧠 SMART STATUS UPDATE: Only update status if TODAY is inside the leave dates
+        const today = new Date();
+        today.setHours(0,0,0,0);
+        
+        const reqStart = new Date(row[COL_REQ_START_DATE]);
+        reqStart.setHours(0,0,0,0);
+        
+        const reqEnd = new Date(row[COL_REQ_END_DATE]);
+        reqEnd.setHours(0,0,0,0);
+
+        if (today.getTime() >= reqStart.getTime() && today.getTime() <= reqEnd.getTime()) {
+             updateUserSlackStatus(requesterId, type, row[COL_REQ_END_DATE]);
+        }
+    }
+    
+    const status = approve ? "approved" : "rejected";
+    // NOTE: Backend status remains "approved/rejected", but UI button was "Noted/Let's Talk"
+    postSlackMessage(approverId, `Request ${status}.`);
+    postSlackMessage(requesterId, `Your ${type} request was ${status}.`);
+    if (APPROVAL_CHANNEL) postSlackMessage(APPROVAL_CHANNEL, `<@${requesterId}>'s ${type} request was ${status}.`);
+}
+
+function handleMyBalance(userId) {
+  if (!_cachedUserMap) loadUserData();
+  const user = _cachedUserMap[userId];
+  if (!user) return postSlackMessage(userId, "⚠ You are not registered.");
+  
+  const stats = calculateUserStats(userId);
+  const annPendingText = stats.pendingAnnual > 0 ? ` (*${stats.pendingAnnual}* pending)` : '';
+  const sickPendingText = stats.pendingSick > 0 ? ` (*${stats.pendingSick}* pending)` : '';
+  
+  postSlackMessage(userId, `*${user.name}*'s Balances:\n🏖 Annual: ${user.balAnn} (Used ${stats.usedAnnual})${annPendingText}\n🤒 Sick: ${user.balSick} (Used ${stats.usedSick})${sickPendingText}`);
+}
+
+function handleTeamBalance(userId) {
+  if (!_cachedUserMap) loadUserData();
+  getRequestsData(); 
+  
+  let msg = "*Team Balances (Remaining vs Used):*\n\n";
+  let found = false;
+  
+  for (const id in _cachedUserMap) {
+      const u = _cachedUserMap[id];
+      if (u.appr === userId) {
+          found = true;
+          const stats = calculateUserStats(id);
+          const pAnn = stats.pendingAnnual > 0 ? ` [⏳${stats.pendingAnnual}]` : "";
+          const pSick = stats.pendingSick > 0 ? ` [⏳${stats.pendingSick}]` : "";
+
+          msg += `• *${u.name}*\n   🏖 Ann: *${u.balAnn}* (Used ${stats.usedAnnual})${pAnn}\n   🤒 Sick: *${u.balSick}* (Used ${stats.usedSick})${pSick}\n---\n`;
+      }
+  }
+
+  if (!found) msg = "You have no team members.";
+  postSlackMessage(userId, msg);
+}
+
+// ====================================================================
+// === MODAL OPENERS ===
+// ====================================================================
+
+function openLeaveModal(trigger_id, userId) {
+  // Load basic cache
+  if (!_cachedUserMap) loadUserData();
+  let user = _cachedUserMap[userId];
+  
+  // 🛑 FORCE CHECK ROLE
+  try {
+      if (user) {
+          const sheet = getSheet(SHEET_NAME_USERS);
+          const freshRole = sheet.getRange(user.rowIndex + 1, COL_USER_ROLE + 1).getValue(); 
+          user.role = String(freshRole || "").trim().toUpperCase();
+      }
+  } catch (e) { Logger.log("Role refresh failed, using cache"); }
+
+  const role = user ? user.role : "";
+  const loc = user ? user.loc : "";
+  const appr = user ? user.appr : userId;
+  let wInfo = loc === "UEA" ? "Sat/Sun" : (loc === "BGD" ? "Fri/Sat" : "Fri/Sat");
+  
+  const blocks = [
+      { type: "input", block_id: "leave_type", label: { type: "plain_text", text: "Type" }, element: { type: "static_select", action_id: "type", options: getLeaveTypeOptions() } },
+      { type: "input", block_id: "start_date", label: { type: "plain_text", text: "Start" }, element: { type: "datepicker", action_id: "start" } },
+      { type: "input", block_id: "end_date", label: { type: "plain_text", text: "End" }, element: { type: "datepicker", action_id: "end" } }
+  ];
+
+  if (role === "CC TEAM") {
+      blocks.push({ type: "input", block_id: "weekend_days", label: { type: "plain_text", text: "Select Weekend (CC Team)" }, element: { type: "multi_static_select", action_id: "days", max_selected_items: 2, options: ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d=>({text:{type:"plain_text",text:d},value:d})) } });
+  } else {
+      blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: `*Your Weekend:* ${wInfo} (Role: ${role})` }] });
+  }
+
+  blocks.push({ type: "input", block_id: "approver_select", optional: true, label: { type: "plain_text", text: "Approver" }, element: { type: "users_select", action_id: "approver", initial_user: appr } });
+  blocks.push({ type: "input", block_id: "attachment_url", optional: true, label: { type: "plain_text", text: "Link (Optional)" }, element: { type: "plain_text_input", action_id: "url" } });
+
+  slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "request_leave_modal", title: { type: "plain_text", text: "Request Leave" }, submit: { type: "plain_text", text: "Submit" }, close: { type: "plain_text", text: "Cancel" }, blocks } });
+}
+
+function openWorkingRemotelyModal(trigger_id) {
+    slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "working_remotely_modal", title: { type: "plain_text", text: "Remote Work" }, submit: { type: "plain_text", text: "Submit" }, close: { type: "plain_text", text: "Cancel" }, blocks: [
+        { type: "input", block_id: "start_date", label: { type: "plain_text", text: "Start" }, element: { type: "datepicker", action_id: "start" } },
+        { type: "input", block_id: "end_date", label: { type: "plain_text", text: "End" }, element: { type: "datepicker", action_id: "end" } },
+        { type: "input", block_id: "note", optional: true, label: { type: "plain_text", text: "Note" }, element: { type: "plain_text_input", action_id: "note", multiline: true } }
+    ]}});
+}
+
+function openTeamLeavesFilterModal(trigger_id) {
+  slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "team_leaves_filter_modal", title: { type: "plain_text", text: "Team Leaves" }, submit: { type: "plain_text", text: "View" }, blocks: [
+      { type: "input", block_id: "date_range_start", label: { type: "plain_text", text: "Start" }, element: { type: "datepicker", action_id: "start_date" } },
+      { type: "input", block_id: "date_range_end", label: { type: "plain_text", text: "End" }, element: { type: "datepicker", action_id: "end_date" } }
+  ]}});
+}
+
+function openMyLeavesFilterModal(trigger_id) {
+  slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "my_leaves_filter_modal", title: { type: "plain_text", text: "My Leaves" }, submit: { type: "plain_text", text: "View" }, blocks: [
+      { type: "input", block_id: "date_range_start", label: { type: "plain_text", text: "Start" }, element: { type: "datepicker", action_id: "start_date" } },
+      { type: "input", block_id: "date_range_end", label: { type: "plain_text", text: "End" }, element: { type: "datepicker", action_id: "end_date" } }
+  ]}});
+}
+
+function handleTeamLeavesFilterSubmission(payload) {
+  const userId = payload.user.id;
+  const v = payload.view.state.values;
+  const start = v.date_range_start.start_date.selected_date;
+  const end = v.date_range_end.end_date.selected_date;
+  
+  if (start > end) return { response_action: "errors", errors: { date_range_end: "Invalid Range" } };
+
+  // Generate blocks in background and send via ephemeral
+  const blocks = getTeamLeavesCalendarBlocks(userId, start, end);
+  slackApiFetch("chat.postEphemeral", { channel: userId, user: userId, text: "Calendar", blocks });
+  return { response_action: "clear" };
+}
+
+function handleMyLeavesFilterSubmission(payload) {
+   const userId = payload.user.id;
+   const v = payload.view.state.values;
+   const start = v.date_range_start.start_date.selected_date;
+   const end = v.date_range_end.end_date.selected_date;
+
+   const blocks = getMyLeavesBlocks(userId, start, end);
+   slackApiFetch("chat.postEphemeral", { channel: userId, user: userId, text: "My Leaves", blocks });
+   return { response_action: "clear" };
+}
+
+function getMyLeavesBlocks(userId, filterStart, filterEnd) {
+    const data = getRequestsData();
+    const myLeaves = data.filter(r => r[COL_REQ_SLACK_ID] === userId && toDateString(r[COL_REQ_START_DATE]) <= filterEnd && toDateString(r[COL_REQ_END_DATE]) >= filterStart);
+    
+    const blocks = [{ type: "header", text: { type: "plain_text", text: "My Leaves" } }];
+    if (myLeaves.length === 0) blocks.push({ type: "section", text: { type: "mrkdwn", text: "No leaves found." } });
+    
+    myLeaves.slice(0, 10).forEach(r => {
+        blocks.push({ type: "divider" });
+        blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${r[COL_REQ_TYPE]}*\n${toDateString(r[COL_REQ_START_DATE])} ➡ ${toDateString(r[COL_REQ_END_DATE])}\nStatus: *${r[COL_REQ_STATUS]}*` } });
+    });
+    return blocks;
+}
+
+function getTeamLeavesCalendarBlocks(userId, filterStart, filterEnd) {
+    const data = getRequestsData();
+    if (!_cachedUserMap) loadUserData();
+    
+    const teamIds = Object.keys(_cachedUserMap).filter(id => _cachedUserMap[id].appr === userId);
+    const leaves = data.filter(r => teamIds.includes(r[COL_REQ_SLACK_ID]) && r[COL_REQ_STATUS] !== "Rejected" && toDateString(r[COL_REQ_START_DATE]) <= filterEnd && toDateString(r[COL_REQ_END_DATE]) >= filterStart);
+
+    const blocks = [{ type: "header", text: { type: "plain_text", text: "Team Calendar" } }];
+    if (leaves.length === 0) {
+        blocks.push({ type: "section", text: { type: "mrkdwn", text: "No team leaves found." } });
+        return blocks;
+    }
+
+    leaves.slice(0, 15).forEach(r => {
+        blocks.push({ type: "divider" });
+        blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${r[COL_REQ_NAME]}* - ${r[COL_REQ_TYPE]}\n${toDateString(r[COL_REQ_START_DATE])} ➡ ${toDateString(r[COL_REQ_END_DATE])}` } });
+    });
+    return blocks;
+}
+
+// ====================================================================
+// === HR TOOLS ===
+// ====================================================================
+
+function openAdminBalanceModal(trigger_id, userId) {
+    if (!isHR(userId)) return postSlackMessage(userId, "🚫 Unauthorized.");
+    slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "admin_balance_modal", title: { type: "plain_text", text: "Adjust Balance" }, submit: { type: "plain_text", text: "Save" }, blocks: [
+        { type: "input", block_id: "user_select", label: { type: "plain_text", text: "User" }, element: { type: "users_select", action_id: "user_id" } },
+        { type: "input", block_id: "balance_type", label: { type: "plain_text", text: "Type" }, element: { type: "static_select", action_id: "type", options: [{text:{type:"plain_text",text:"Annual"},value:"Annual"},{text:{type:"plain_text",text:"Sick"},value:"Sick"}] } },
+        { type: "input", block_id: "adjustment_amount", label: { type: "plain_text", text: "Amount (+/-)" }, element: { type: "plain_text_input", action_id: "amount" } }
+    ]}});
+}
+
+function handleAdminBalanceSubmission(payload) {
+    const v = payload.view.state.values;
+    const targetId = v.user_select.user_id.selected_user;
+    const type = v.balance_type.type.selected_option.value;
+    const amount = parseFloat(v.adjustment_amount.amount.value);
+    
+    if (isNaN(amount)) return { response_action: "errors", errors: { adjustment_amount: "Number required" } };
+
+    const idx = getUserRowIndex(targetId);
+    if (idx === -1) return { response_action: "errors", errors: { user_select: "User not found" } };
+
+    const sheet = getSheet(SHEET_NAME_USERS);
+    const col = type === "Annual" ? COL_USER_ANNUAL_BALANCE + 1 : COL_USER_SICK_BALANCE + 1;
+    const current = sheet.getRange(idx+1, col).getValue();
+    sheet.getRange(idx+1, col).setValue(current + amount);
+    
+    CacheService.getScriptCache().remove("USER_MAP_V3"); 
+    postSlackMessage(payload.user.id, `Updated ${type} balance for <@${targetId}> by ${amount}.`);
+    return { response_action: "clear" };
+}
+
+function openPolicyUpdateModal(trigger_id) {
+    slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "update_policy_modal", title: { type: "plain_text", text: "Policy" }, submit: { type: "plain_text", text: "Update" }, blocks: [
+        { type: "input", block_id: "policy_text", label: { type: "plain_text", text: "New Policy" }, element: { type: "plain_text_input", action_id: "text", multiline: true, initial_value: getCurrentPolicyText() } }
+    ]}});
+}
+
+function handlePolicyUpdateSubmission(payload) {
+    const text = payload.view.state.values.policy_text.text.value;
+    getSheet(SHEET_NAME_POLICY).getRange(POLICY_CELL).setValue(text);
+    postSlackMessage(payload.user.id, "Policy updated.");
+    updateSlackHome(payload.user.id);
+    return { response_action: "clear" };
+}
+
+function openAnnouncementModal(trigger_id) {
+    slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "send_announcement_modal", title: { type: "plain_text", text: "Announcement" }, submit: { type: "plain_text", text: "Send" }, blocks: [
+        { type: "input", block_id: "msg", label: { type: "plain_text", text: "Message" }, element: { type: "plain_text_input", action_id: "text", multiline: true } }
+    ]}});
+}
+
+function handleAnnouncementSubmission(payload) {
+    const text = payload.view.state.values.msg.text.value;
+    if (!_cachedUserMap) loadUserData();
+    let count = 0;
+    for (const id in _cachedUserMap) {
+        postSlackMessage(id, `:mega: *Announcement:*\n${text}`);
+        count++;
+    }
+    postSlackMessage(payload.user.id, `Sent to ${count} users.`);
+    return { response_action: "clear" };
+}
+
+function openHRReportModal(trigger_id) {
+    slackApiFetch("views.open", { trigger_id, view: { type: "modal", callback_id: "generate_hr_report", title: { type: "plain_text", text: "Report" }, submit: { type: "plain_text", text: "Download" }, blocks: [
+        { type: "input", block_id: "start", label: { type: "plain_text", text: "Start" }, element: { type: "datepicker", action_id: "date" } },
+        { type: "input", block_id: "end", label: { type: "plain_text", text: "End" }, element: { type: "datepicker", action_id: "date" } }
+    ]}});
+}
+
+function handleHRReportSubmission(payload) {
+    const start = payload.view.state.values.start.date.selected_date;
+    const end = payload.view.state.values.end.date.selected_date;
+    
+    const data = getRequestsData();
+    const filtered = data.filter(r => toDateString(r[COL_REQ_START_DATE]) <= end && toDateString(r[COL_REQ_END_DATE]) >= start);
+    
+    if (filtered.length === 0) { postSlackMessage(payload.user.id, "No data."); return { response_action: "clear" }; }
+
+    const csv = filtered.map(r => r.join(",")).join("\n");
+    const file = DriveApp.createFile(`Report_${start}.csv`, csv, MimeType.CSV);
+    postSlackMessage(payload.user.id, `Report: <${file.getUrl()}|Download>`);
+    return { response_action: "clear" };
+}
+
+// ====================================================================
+// === 🗓 AUTOMATIC MONTHLY BALANCE INCREMENT ===
+// ====================================================================
+
+function incrementMonthlyBalances() {
+  const sheet = getSheet(SHEET_NAME_USERS);
+  const range = sheet.getDataRange();
+  const data = range.getValues();
+  let updates = 0;
+
+  // Start loop at 1 to skip the Header row
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const slackId = row[COL_USER_SLACK_ID];
+    
+    if (!slackId || slackId === "Slack ID") continue;
+
+    const location = String(row[COL_USER_LOCATION] || "").trim().toUpperCase();
+    let increment = 0;
+    
+    if (location === "BGD") { increment = 1.75; } 
+    else if (location === "UEA") { increment = 2.5; }
+    
+    if (increment > 0) {
+       const currentBalance = parseFloat(row[COL_USER_ANNUAL_BALANCE]) || 0;
+       const newBalance = currentBalance + increment;
+       
+       data[i][COL_USER_ANNUAL_BALANCE] = newBalance;
+       updates++;
+
+       try {
+           const msg = `💰 *Monthly Update:* Your Annual Leave balance has increased by *+${increment} days*.\nNew Balance: *${newBalance}*`;
+           postSlackMessage(slackId, msg);
+           Utilities.sleep(200); 
+       } catch (e) {
+           Logger.log(`Failed to notify ${slackId}: ${e.message}`);
+       }
+    }
+  }
+
+  if (updates > 0) {
+      range.setValues(data);
+      CacheService.getScriptCache().remove("USER_MAP_V3");
+      _cachedUserMap = null;
+      logAuditEntry("SYSTEM", "ALL", "MONTHLY_INCREMENT", `Updated balances for ${updates} users.`);
+      Logger.log(`✅ Successfully incremented balances and notified ${updates} users.`);
+  } else {
+      Logger.log("ℹ No eligible users found for increment.");
+  }
+}
+
+// ====================================================================
+// === 🏠 HOME TAB WITH HIERARCHY ===
+// ====================================================================
+
+function updateSlackHome(userId) {
+  // 1. Ensure Data is Loaded
+  if (!_cachedUserMap) loadUserData();
+  const user = _cachedUserMap[userId];
+  const pol = getCurrentPolicyText();
+  
+  // 2. 🌳 Calculate Hierarchy Tree
+  let hierarchyBlock = { type: "section", text: { type: "mrkdwn", text: "⚠ Hierarchy unavailable (User not found)." } };
+  
+  if (user) {
+      // Level 1: Direct Manager
+      const m1Id = user.appr;
+      // We try to get the Name from cache; if not found, we use the Slack ID tag
+      const m1Name = (m1Id && _cachedUserMap[m1Id]) ? _cachedUserMap[m1Id].name : (m1Id ? `<@${m1Id}>` : "None");
+      
+      // Level 2: Manager's Manager
+      let m2Id = null;
+      let m2Name = "None";
+      if (m1Id && _cachedUserMap[m1Id]) {
+          m2Id = _cachedUserMap[m1Id].appr; // Look up L1's approver
+          if (m2Id && _cachedUserMap[m2Id]) m2Name = _cachedUserMap[m2Id].name;
+          else if (m2Id) m2Name = `<@${m2Id}>`;
+      }
+
+      // Level 3: Manager's Manager's Manager
+      let m3Id = null;
+      let m3Name = "None";
+      if (m2Id && _cachedUserMap[m2Id]) {
+          m3Id = _cachedUserMap[m2Id].appr; // Look up L2's approver
+          if (m3Id && _cachedUserMap[m3Id]) m3Name = _cachedUserMap[m3Id].name;
+          else if (m3Id) m3Name = `<@${m3Id}>`;
+      }
+      
+      const treeText = `*📋 Your Reporting Line:*\n` +
+                       ` *Direct Manager:* ${m1Name}\n` +
+                       ` *Level 2 Manager:* ${m2Name}\n` +
+                       ` *Level 3 Manager:* ${m3Name}`;
+
+      hierarchyBlock = { type: "section", text: { type: "mrkdwn", text: treeText } };
+  }
+
+  // 3. Construct the View Blocks
+  const blocks = [
+     { type: "header", text: { type: "plain_text", text: "Leave Dashboard" } },
+     { type: "divider" },
+     // Balance Section
+     { type: "section", text: { type: "mrkdwn", text: `*Balance:* 🏖 ${user ? user.balAnn : 0} | 🤒 ${user ? user.balSick : 0}` } },
+     
+     // 🌳 NEW HIERARCHY SECTION ADDED HERE 🌳
+     { type: "divider" },
+     hierarchyBlock,
+     { type: "divider" },
+
+     // Action Buttons
+     { type: "actions", elements: [
+        { type: "button", text: { type: "plain_text", text: "Request Leave" }, action_id: "request_leave_home", style: "primary" },
+        { type: "button", text: { type: "plain_text", text: "Remote Work" }, action_id: "working_remotely_home" },
+        { type: "button", text: { type: "plain_text", text: "Team Balances" }, action_id: "team_balance_home" }
+     ]},
+     { type: "actions", elements: [
+        { type: "button", text: { type: "plain_text", text: "My Leaves" }, action_id: "my_leaves_home" },
+        { type: "button", text: { type: "plain_text", text: "Team Leaves" }, action_id: "team_leaves_home" }
+     ]},
+     { type: "divider" },
+     { type: "context", elements: [{ type: "mrkdwn", text: `*Policy:* ${pol}` }] }
+  ];
+  
+  // HR Tools (Only visible to HR)
+  if (isHR(userId)) {
+      blocks.push({ type: "divider" }, { type: "header", text: { type: "plain_text", text: "HR Admin" } });
+      blocks.push({ type: "actions", elements: [
+          { type: "button", text: { type: "plain_text", text: "Adjust Balance" }, action_id: "admin_balances", style: "danger" },
+          { type: "button", text: { type: "plain_text", text: "Report" }, action_id: "hr_reports" },
+          { type: "button", text: { type: "plain_text", text: "Policy" }, action_id: "update_policy" },
+          { type: "button", text: { type: "plain_text", text: "Announce" }, action_id: "send_announcement" },
+          { type: "button", text: { type: "plain_text", text: "🔄 Refresh Data" }, action_id: "refresh_data" }
+      ]});
+  }
+  
+  slackApiFetch("views.publish", { user_id: userId, view: { type: "home", blocks } });
+}
+
+// ====================================================================
+// === ⏰ DAILY STATUS CRON JOB (NEW) ===
+// ====================================================================
+
+/**
+ * ⚡ IMPORTANT: Set a "Time-driven" trigger for this function.
+ * Recommended: Daily at 8:00 AM.
+ */
+function setDailyLeaveStatuses() {
+  const sheet = getSheet(SHEET_NAME_REQUESTS);
+  const data = sheet.getDataRange().getValues(); // Get fresh data
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  let updatesCount = 0;
+
+  // Start at 1 to skip header
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    
+    // Check if Status is APPROVED
+    if (row[COL_REQ_STATUS] !== "Approved") continue;
+
+    const slackId = row[COL_REQ_SLACK_ID];
+    const type = row[COL_REQ_TYPE];
+    
+    // Parse Dates
+    const start = new Date(row[COL_REQ_START_DATE]);
+    const end = new Date(row[COL_REQ_END_DATE]);
+    start.setHours(0,0,0,0);
+    end.setHours(0,0,0,0);
+
+    // Check if TODAY is inside the leave period
+    if (today.getTime() >= start.getTime() && today.getTime() <= end.getTime()) {
+        try {
+            updateUserSlackStatus(slackId, type, row[COL_REQ_END_DATE]);
+            updatesCount++;
+            // Sleep briefly to prevent hitting Slack API rate limits
+            Utilities.sleep(300); 
+        } catch (e) {
+            Logger.log(`Error updating status for ${slackId}: ${e.message}`);
+        }
+    }
+  }
+  Logger.log(`✅ Daily Status Check: Updated status for ${updatesCount} users.`);
+}
